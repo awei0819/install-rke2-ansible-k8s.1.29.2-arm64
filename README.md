@@ -5,6 +5,7 @@ rke2-ansible-1.29.2
 rke2官方文档：[Introduction | RKE2](https://docs.rke2.io/)
 
 需要下载rke2制品包，然后使用脚本部署rke2-k8s集群
+如果是amd架构或其他k8s版本，下载同理，需自行修改playbook中文件名（arm64）以及 k8s版本号
 
 ```
 # 五个文件，一个rke2-k8s安装包
