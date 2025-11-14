@@ -1,0 +1,381 @@
+---
+- name: 准备RKE2预置证书目录
+  hosts: rke2-masters
+  gather_facts: no  # 关闭事实收集，加速执行
+
+  tasks:
+    # 1. 创建证书目录
+    - name: 创建RKE2证书目录
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+        recurse: yes  # 自动创建父目录，等价于mkdir -p
+      loop:
+        - /data/rke2/server/tls
+        - /data/rke2/server/tls/etcd
+
+- name: 准备RKE2预置证书（有效期100年）
+  hosts: localhost
+  gather_facts: no  # 关闭事实收集，加速执行
+
+  tasks:
+    - name: 创建证书文件
+      ansible.builtin.script:
+        cmd: ./create_tls.sh
+        executable: /bin/bash
+      register: script_result  # 可选：记录脚本执行结果
+
+    # 可选：输出脚本执行结果（便于调试）
+    - name: 显示脚本执行结果
+      ansible.builtin.debug:
+        var: script_result.stdout_lines
+      when: script_result.changed
+
+
+- name: 准备RKE2部署环境
+  hosts: rke2
+  gather_facts: no  # 关闭事实收集，加速执行
+
+  tasks:
+    # 1. 创建目录（删除复杂的changed_when，依赖模块自带状态）
+    - name: 创建RKE2所需目录
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        recurse: yes  # 自动创建父目录，等价于mkdir -p
+      loop:
+        - /root/rke2-artifacts
+        - /data/rke2/agent/images
+        - /usr/local/rke2
+        - /etc/rancher/rke2
+
+    # 2. 复制离线包（SSH压缩加速）
+    - name: 复制rke2离线包到远程节点
+      copy:
+        src: rke2-offline-amd64-k8s1.29.2.tgz
+        dest: /root/rke2-artifacts/rke2-offline-amd64-k8s1.29.2.tgz
+        remote_src: no
+
+    # 3. 解压文件（creates参数确保仅执行一次）
+    - name: 解压主离线包
+      ansible.builtin.unarchive:
+        src: /root/rke2-artifacts/rke2-offline-amd64-k8s1.29.2.tgz
+        dest: /root/rke2-artifacts/
+        remote_src: yes  # 源文件在远程节点
+        extra_opts: [--strip-components=0]  # 保持原目录结构
+        creates: /root/rke2-artifacts/rke2.linux-amd64.tar.gz  # 目标文件存在则跳过
+
+    - name: 解压rke2二进制包
+      ansible.builtin.unarchive:
+        src: /root/rke2-artifacts/rke2.linux-amd64.tar.gz
+        dest: /usr/local/rke2/
+        remote_src: yes
+        extra_opts: [--strip-components=0]
+        creates: /usr/local/rke2/bin/rke2  # 二进制文件存在则跳过
+
+    # 4. 同步镜像目录
+    - name: 同步rke2_images目录
+      ansible.builtin.copy:
+        src: /root/rke2-artifacts/images/rke2_images/
+        dest: /data/rke2/agent/images/
+        remote_src: yes
+    - name: 同步calico_images目录
+      ansible.builtin.copy:
+        src: /root/rke2-artifacts/images/calico_images/
+        dest: /data/rke2/agent/images/
+        remote_src: yes
+
+    # 5. 复制清单文件和二进制文件
+    - name: 复制rke2-images清单文件
+      ansible.builtin.copy:
+        src: /root/rke2-artifacts/rke2-images.linux-amd64.txt
+        dest: /data/rke2/agent/images/rke2-images.linux-amd64.txt
+        remote_src: yes
+
+    - name: 复制并设置rke2二进制文件权限
+      ansible.builtin.copy:
+        src: /usr/local/rke2/bin/rke2
+        dest: /usr/bin/rke2
+        remote_src: yes
+
+
+
+- name: 创建config.yaml
+  hosts: localhost
+  gather_facts: no
+
+  tasks:
+    - name: 创建config.yaml
+      ansible.builtin.script:
+        cmd: ./create_config.sh
+        executable: /bin/bash
+      register: script_result  # 可选：记录脚本执行结果
+
+    # 可选：输出脚本执行结果（便于调试）
+    - name: 显示脚本执行结果
+      ansible.builtin.debug:
+        var: script_result.stdout_lines
+      when: script_result.changed
+
+
+
+
+- name: 执行rke2-install.sh(rke2-server1)
+  hosts: localhost
+  gather_facts: no
+
+  tasks:
+    - name: 执行rke2-install.sh
+      ansible.builtin.shell:
+        cmd: |
+          chmod +x /root/rke2-artifacts/install.sh
+          export INSTALL_RKE2_ARTIFACT_PATH=/root/rke2-artifacts
+          export INSTALL_RKE2_TYPE=server
+          export INSTALL_RKE2_ARCH=amd64
+          /root/rke2-artifacts/install.sh
+        executable: /bin/bash
+
+
+- name: 启用并启动 rke2-server 服务（rke2-server1）
+  hosts: localhost
+  gather_facts: no
+  become: yes  # 操作 systemd 服务需 root 权限（必加）
+
+  tasks:
+    - name: 启动 rke2-server master1
+      ansible.builtin.systemd:
+        name: rke2-server  # 服务名称
+        enabled: yes       # 启用开机自启
+        state: started     # 启动服务
+        daemon_reload: yes
+      register: start_result
+      # 最多重试5次，每次次间隔10秒
+      retries: 30
+      delay: 10
+      # 只有当服务状态不是active时才重试
+      until: start_result.status.ActiveState == "active"
+
+    - name: 检查 rke2-server 服务最终状态
+      ansible.builtin.systemd:
+        name: rke2-server
+        state: started
+      register: server_status
+      failed_when: server_status.status.ActiveState != "active"  # 最终状态非active则任务失败
+
+    - name: 输出 rke2-server 服务状态
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} 的 rke2-server 服务状态：{{ server_status.status.ActiveState }}"
+
+- name: 创建.kube目录 master1
+  hosts: localhost
+  gather_facts: no  # 关闭事实收集，加速执行
+
+  tasks:
+    - name: 创建.kube目录
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        recurse: yes  # 自动创建父目录，等价于mkdir -p
+      loop:
+        - /root/.kube
+ 
+- name: 复制kubelet/config文件 master1
+  hosts: localhost
+  gather_facts: no
+
+  tasks:
+    - name: 复制kubelet
+      ansible.builtin.copy:
+        src: /data/rke2/bin/kubectl
+        dest: /usr/bin/kubectl
+        remote_src: yes
+    - name: kubelet +x
+      ansible.builtin.shell:
+        cmd: |
+          chmod +x /usr/bin/kubectl
+        executable: /bin/bash
+    - name: 复制config
+      ansible.builtin.copy:
+        src: /etc/rancher/rke2/rke2.yaml
+        dest: /root/.kube/config
+        remote_src: yes
+
+
+
+- name: 设置ansible变量
+  hosts: localhost  # 在控制节点执行（假设cluster.yaml在控制节点）
+  gather_facts: no
+  vars:
+    # cluster.yaml文件路径（根据实际位置调整）
+    cluster_yaml_path: "./cluster.yaml"
+
+  tasks:
+    # 1. 检查cluster.yaml文件是否存在
+    - name: 验证cluster.yaml文件存在
+      ansible.builtin.stat:
+        path: "{{ cluster_yaml_path }}"
+      register: cluster_file
+      failed_when: not cluster_file.stat.exists  # 文件不存在则报错退出
+
+    # 2. 提取local-address的值（假设格式为 "local-address: 192.168.80.100"）
+    - name: 提取local-address的值
+      ansible.builtin.shell: |
+        grep "^local-address:" {{ cluster_yaml_path }} | awk -F': ' '{print $NF}'
+      register: local_address_result
+      changed_when: false  # 标记为无状态变更（非修改操作）
+      failed_when: local_address_result.stdout == ""  # 提取为空则报错
+
+    - name: 注册local_address变量至localhost
+      ansible.builtin.set_fact:
+        local_address: "{{ local_address_result.stdout }}"
+      delegate_facts: yes  # 允许将事实注册到指定节点
+      delegate_to: localhost  # 注册到控制节点
+      run_once: yes  # 仅执行一次（避免重复注册）
+
+    - name: 提取node_token的值
+      ansible.builtin.shell: |
+        cat /data/rke2/server/node-token
+      register: node_token_result
+      changed_when: false
+      failed_when: node_token_result.stdout == ""
+
+    - name: 注册node_token变量至localhost
+      ansible.builtin.set_fact:
+        node_token: "{{ node_token_result.stdout }}"
+      delegate_facts: yes
+      delegate_to: localhost
+      run_once: yes
+
+
+- name: 更新config.yaml(添加node-token)
+  hosts: rke2:!{{ hostvars['localhost'].local_address }}
+  gather_facts: no
+
+  tasks:
+    - name: 
+      ansible.builtin.shell:
+        cmd: |
+          sed -i "/^cni: calico/iserver: https://{{ hostvars['localhost'].local_address }}:9345" /etc/rancher/rke2/config.yaml
+          sed -i "/^cni: calico/itoken: {{ hostvars['localhost'].node_token }}" /etc/rancher/rke2/config.yaml
+        executable: /bin/bash
+
+
+- name: 执行rke2-install.sh
+  hosts: rke2-masters:!{{ hostvars['localhost'].local_address }}
+  gather_facts: no
+
+  tasks:
+#    - name: 复制master1-rke2证书文件（有效期100年））
+#      ansible.builtin.copy:
+#        src: /data/rke2/server/tls/
+#        dest: /data/rke2/server/tls/
+#        remote_src: no # 从本机复制到远程主机
+    - name: 复制master1-rke2证书变量文件（有效期100年））
+      ansible.builtin.copy:
+        src: /etc/default/rke2-server
+        dest: /etc/default/rke2-server
+        remote_src: no # 从本机复制到远程主机
+    - name: 执行rke2-install.sh(其他-server)
+      ansible.builtin.shell:
+        cmd: |
+          chmod +x /root/rke2-artifacts/install.sh
+          export INSTALL_RKE2_ARTIFACT_PATH=/root/rke2-artifacts
+          export INSTALL_RKE2_TYPE=server
+          export INSTALL_RKE2_ARCH=amd64
+          /root/rke2-artifacts/install.sh
+        executable: /bin/bash
+        
+
+
+- name: 执行rke2-install.sh(agent)
+  hosts: rke2-workers
+  gather_facts: no
+
+  tasks:
+    - name: 执行rke2-install.sh
+      ansible.builtin.shell:
+        cmd: |
+          chmod +x /root/rke2-artifacts/install.sh
+          export INSTALL_RKE2_ARTIFACT_PATH=/root/rke2-artifacts
+          export INSTALL_RKE2_TYPE=agent
+          export INSTALL_RKE2_ARCH=amd64
+          /root/rke2-artifacts/install.sh
+        executable: /bin/bash
+
+
+- name: 启动 rke2-server 服务（rke2-server-node）
+  hosts: rke2-masters:!{{ hostvars['localhost'].local_address }}  # 仅作用于 master 节点组
+  gather_facts: no
+  become: yes  # 操作 systemd 服务需 root 权限（必加）
+
+  tasks:
+    - name: 启用并启动 rke2-server 服务
+      ansible.builtin.systemd:
+        name: rke2-server  # 服务名称
+        enabled: yes       # 启用开机自启
+        state: started     # 启动服务
+        daemon_reload: yes
+      register: start_result
+      retries: 30          # 最多重试5次（总计尝试6次）
+      delay: 10          # 每次重试间隔15秒
+      until: start_result is succeeded and 
+             start_result.status.ActiveState == "active"  # 重试直到服务成功启动并处于active状态
+
+    - name: 输出 rke2-server 服务状态
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} 的 rke2-server 服务状态：{{ start_result.status.ActiveState }}"
+        
+    - name: 创建.kube目录
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        recurse: yes  # 自动创建父目录，等价于mkdir -p
+      loop:
+        - /root/.kube
+        
+    - name: 复制kubelet
+      ansible.builtin.copy:
+        src: /data/rke2/bin/kubectl
+        dest: /usr/bin/kubectl
+        remote_src: yes
+    - name: kubelet +x
+      ansible.builtin.shell:
+        cmd: |
+          chmod +x /usr/bin/kubectl
+        executable: /bin/bash
+    - name: 复制config
+      ansible.builtin.copy:
+        src: /etc/rancher/rke2/rke2.yaml
+        dest: /root/.kube/config
+        remote_src: yes  
+        
+    
+
+- name: 启用并启动 rke2-agent 服务（rke2-workers 组）
+  hosts: rke2-workers  # 仅作用于 worker 节点组
+  gather_facts: no
+  become: yes  # 操作 systemd 服务需 root 权限（必加）
+
+  tasks:
+    - name: 启用并启动 rke2-agent 服务
+      ansible.builtin.systemd:
+        name: rke2-agent
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      register: start_result
+      retries: 30  # 最多重试5次（总计6次尝试）
+      delay: 10   # 每次重试间隔15秒
+      until: start_result is succeeded and 
+             start_result.status.ActiveState == "active"  # 重试直到服务激活动成功
+
+    - name: 输出 rke2-agent 服务状态
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} 的 rke2-agent 服务状态：{{ start_result.status.ActiveState }}"
+   
+
+

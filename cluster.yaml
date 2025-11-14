@@ -1,0 +1,20 @@
+local-address: 192.168.80.21
+
+master:
+  - 192.168.80.21
+  - 192.168.80.22
+  - 192.168.80.23
+node:
+  - 192.168.80.24
+  - 192.168.80.25
+  - 192.168.80.26
+
+data-dir: /data/rke2
+
+calico-net: ens*
+
+mirrors:
+    endpoint: https://reg.jthh.icloud.sinopec.com
+    auth:
+      username: admin
+      password: Hbqwer_1567_dsao32!
