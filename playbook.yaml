@@ -376,6 +376,31 @@
     - name: 输出 rke2-agent 服务状态
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }} 的 rke2-agent 服务状态：{{ start_result.status.ActiveState }}"
+
+
+- name: containerd.sock 软链
+  hosts: rke2
+  gather_facts: no
+  become: yes  # 操作 systemd 服务需 root 权限（必加）
+  tasks:  
+    - name: 创建containerd.sock软链接
+      ansible.builtin.file:
+        src: "/run/k3s/containerd/containerd.sock"
+        dest: "/run/containerd/containerd.sock"
+        state: link
+        force: true  # 若已存在链接，强制覆盖
+
+
+- name: config文件 加权
+  hosts: rke2-masters
+  gather_facts: no
+  become: yes  # 操作 systemd 服务需 root 权限（必加）
+  tasks:  
+    - name: config 600
+      ansible.builtin.shell:
+        cmd: |
+          chmod 600 /root/.kube/config
+        executable: /bin/bash
    
 
 
